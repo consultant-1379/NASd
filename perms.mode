@@ -1,0 +1,13 @@
+####################################
+## 			PERMS FILE			  ##
+## element user group permissions ##
+####################################
+
+NAS-online.service root root 755
+NAS_Monitor.bsh root root 755
+NASd.sh root root 755
+NASd.service root root 755
+NAS-online.bsh root root 755
+
+version root root 755
+version/pkginfo root root 444

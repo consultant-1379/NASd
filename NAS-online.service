@@ -1,0 +1,12 @@
+[Unit]
+Description=Milestone NAS Service
+Requires=NASd.service
+After=NASd.service
+
+[Service]
+User=root
+Group=root
+ExecStart= /eniq/smf/nasd/NAS-online.bsh
+
+[Install]
+WantedBy=multi-user.target

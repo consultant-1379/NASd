@@ -1,0 +1,35 @@
+#!/usr/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : NAS-online.bsh 
+# Date    : 17/08/2018
+# Revision: /main/1
+# Purpose : Main wrapper script handling the NAS-online.service file
+#
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+ECHO=/usr/bin/echo
+
+
+$ECHO  "Starting NAS-online service"
+
+while [ 1 ]
+do
+sleep 2
+done

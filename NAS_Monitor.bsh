@@ -1,0 +1,1002 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name    : NAS_Monitor.bsh
+# Updated : 24/08/2023
+# Revision: \main\40
+# Purpose :
+#
+# ********************************************************************
+#
+# **********************    Command Section     **********************
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+LSOF=/usr/sbin/lsof
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+PGREP=/usr/bin/pgrep
+PING=/usr/bin/ping
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SYSTEMCTL=/usr/bin/systemctl
+TAIL=/usr/bin/tail
+TIMEOUT=/usr/bin/timeout
+TOUCH=/usr/bin/touch
+UEMCLI=/usr/bin/uemcli
+UNAME=/usr/bin/uname
+UMOUNT=/usr/bin/umount
+WAIT=wait
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+
+# ********************************************************************
+#
+# **********************  Configuration Section  *********************
+#
+# ********************************************************************
+#
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+#Common Libraries
+readonly ENIQ_LIB_DIR="/eniq/installation/core_install/lib"
+
+# The NAS storage milestone.
+readonly NAS_online_FMRI="NAS-online.service"
+
+# File containing list of FileSystems to mount and monitor
+readonly NASd_FS_LIST_FILE="/eniq/smf/nasd/nasd_config"
+
+#Location of NAS monitor script
+readonly NAS_MON_SCRIPT="/bin/bash\ /eniq/smf/nasd/NAS_Monitor.bsh"
+
+# DEBUG flag file to compress touch warnings
+readonly NAS_DEBUG_FILE="eniq/smf/nasd/nas_debug_file"
+
+# Tempaory Directory for NASd scripts
+readonly NAS_TEMP=/tmp/NASd
+$MKDIR -p ${NAS_TEMP} >> /dev/null 2>&1
+
+readonly SERVER_HOSTNAME=`hostname`
+
+# Location of Logfile
+readonly LOG_DIRECTORY="/eniq/local_logs/NASd"
+
+$MKDIR -p ${LOG_DIRECTORY} >> /dev/null 2>&1
+readonly LOGFILE="${LOG_DIRECTORY}/NASd.log"
+
+readonly RO_INDICATOR="ro_indicator"
+
+readonly ENIQ_CONF_DIR="/eniq/installation/config"
+
+# ==================  Configure mount options and timeout  ====================
+# Options for the Mount command. e.g. "-o exec,rw,nosuid,timeo=300"
+# Specify FSType-specific options in a comma separated list of suboptions
+readonly MOUNT_OPTIONS="rw,soft,nodev,nosuid,nordirplus"
+# Maximum number of seconds to wait for mount to finish.
+readonly MOUNT_TIME_OUT_TIME=40
+
+# ==================  Configure how often to check and timeout  ===============
+# File to check for on NFS filesystems.
+readonly TAGFILE=".tagfile"
+# Number of seconds to sleep for between monitoring NAS
+readonly LOOP_SLEEP_TIME=10
+
+# =========================   Configure NAS Timeouts   ========================
+# Number of seconds to wait for response from NAS after "touch" on FS
+readonly WAIT_FOR_NAS_RESPONSE=20
+# Number of seconds to wait for between detecting fault with NAS and
+# waiting to allow NAS to failover and recover, before disabling NAS.
+readonly WAIT_FOR_FAILOVER=10
+# Number of retrys
+readonly NO_RETRYS_FOR_NAS_FAILOVER=60
+
+# ============================  Configure Backoff timeout  ====================
+# After waiting for failover timeout and if NAS is still offline,
+# backoff and only try to mount filesystems every xxx seconds.
+readonly LOOP_RETRYS_BEFORE_TIMEOUT=10
+readonly BACKOFF_SLEEP_TIME=600
+
+# Used to break out of Sleep. An interrupt function will set this to true
+WAKE=false
+
+#Used to handle restore case if new NAS fs is created with parent directory already mounted
+RESTORE_STAGE_FILE=/var/tmp/bmr/eniq_restore_stage
+
+# ********************************************************************
+#
+# **************************     Functions    ************************
+#
+# ********************************************************************
+#
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    return 1
+else
+    return 0
+fi
+}
+
+### Function: check_nas_process ###
+#
+#   Check if another instance is running or not
+#   If there is instance running print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_nas_process()
+{
+_check_monitor_=${NAS_TEMP}/nas_monitor_count
+$PGREP -fx "$NAS_MON_SCRIPT" | wc -l > ${_check_monitor_}
+_nas_count_=`$CAT ${_check_monitor_}`
+if [ "${_nas_count_}" -eq 1 ]; then
+  return 0
+else
+  return 1
+fi
+}
+### Function: check_for_NFS_mounts ###
+#
+# Check that NFS are mounted.
+#
+# Uses Global Variable: FILE_SYSTEMS_LIST
+# Arguments: none
+# Return Values:
+#       0 for success;
+#       1 for failure;
+check_for_NFS_mounts()
+{
+local return_code=0
+local NFS_Share=""
+
+# Instead of running mount -p many times, there would be less overhead to print the list
+# of mounted filesystems once and output result to a file.
+# Then parse this file to check if required filesystem is mounted.
+MOUNTED_FS_LIST=${NAS_TEMP}/NASd_MOUNTED_FS_LIST
+$RM -f ${MOUNTED_FS_LIST} >> /dev/null 2>&1
+$MOUNT -l > ${MOUNTED_FS_LIST}
+
+# Loop through each filesystem listed in fs config file.
+while read fs_config_LINE; do
+    NFS_Share=`echo ${fs_config_LINE} | $AWK -F"::" '{print $2}'`
+
+    # Check if NFS is mounted:
+    $GREP ${NFS_Share} ${MOUNTED_FS_LIST} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit "WARNING:: Filesystem '${NFS_Share}' is not mounted."
+        return_code=1
+    fi
+done < ${FILE_SYSTEMS_LIST}
+
+return ${return_code}
+}
+
+### Function: check_mounted_filesystems ###
+#
+# Check if NFS mounts are ok by creating .tagfile and don't hang
+#
+# Uses Global Variable: WAIT_FOR_NAS_RESPONSE; WAIT_FOR_FAILOVER; NO_RETRYS_FOR_NAS_FAILOVER;
+# Arguments    : none
+# Return Values: 0 for success;
+#                1 for failure;
+check_mounted_filesystems()
+{
+# Track number of failed attempts to mount filesystems or contact mounted NFS.
+local REPEATING_NAS_RESPONSE_ERROR_COUNT=0
+local NFS_MountPoint=""
+local return_code=0
+
+while [ "${REPEATING_NAS_RESPONSE_ERROR_COUNT}" -le "${NO_RETRYS_FOR_NAS_FAILOVER}" ]; do
+    return_code=0
+    # Save all background process ids
+    LS_PID_LIST=""
+
+    # Make a file to store the PID and the filesystem name
+    _temp_pid_list_file_=${NAS_TEMP}/temp_pid_list_file
+    $RM -f ${_temp_pid_list_file_} >> /dev/null 2>&1
+    $RM -f ${NAS_TEMP}/nas_fs_list_file >> /dev/null 2>&1
+
+    _check_after_4_retries_=`$EXPR $REPEATING_NAS_RESPONSE_ERROR_COUNT % 4`
+    if [ $REPEATING_NAS_RESPONSE_ERROR_COUNT -ne 0 -a ${_check_after_4_retries_} -eq 0 ]; then
+         while read file_system_line; do
+
+               # Checking RO_INDICATOR flag on NAS Filesystems to verify if the Filesystem is full
+               _nfs_mount_point_=`$ECHO ${file_system_line} | $AWK -F"::" '{print $3}'`
+               logit "Checking ${RO_INDICATOR} is present on ${_nfs_mount_point_}"
+               $TIMEOUT 5 $LS ${_nfs_mount_point_}/${RO_INDICATOR} >> /dev/null 2>&1
+               if [ $? -eq 0 ]; then
+                    logit "ERROR:: File ${RO_INDICATOR} found on ${_nfs_mount_point_}"
+                    return 1
+               else
+                    $ECHO "${_nfs_mount_point_}/${RO_INDICATOR}:Not Present" >> ${NAS_TEMP}/nas_fs_list_file
+               fi
+
+               # Checking NAS virtual IP associated with each NAS Filesystem
+               _nfs_vip_=`$ECHO ${file_system_line} | $AWK -F"::" '{print $1}'`
+               logit "Checking if ${_nfs_vip_} associated with ${_nfs_mount_point_} is pingable"
+               $PING -c4 ${_nfs_vip_} >> /dev/null 2>&1
+               if [ $? -ne 0 ]; then
+                    logit "ERROR:: ${_nfs_vip_} associated with ${_nfs_mount_point_} is not pingable"
+                    return 1
+               fi
+
+               # Getting list of NAS shares from the NAS server
+               if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    ${_nascli_} list_shares - ${_nas_sysid_} | $AWK  '{print $1}' > ${NAS_TEMP}/nas_share_list
+               else
+                    $UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs/nfs show -filter "Export path" -output csv | $SED 's/"//g' | $TAIL -n +2 | $AWK -F":" '{print $2}' > ${NAS_TEMP}/nas_share_list
+               fi
+
+               # Checking if NFS share exists for the NAS Filesystem
+               _nfs_share_path_=`$ECHO ${file_system_line} | $AWK -F"::" '{print $2}'`
+               logit "Checking if share ${_nfs_share_path_} associated with ${_nfs_mount_point_} is available"
+               $GREP -w "${_nfs_share_path_}" ${NAS_TEMP}/nas_share_list >> /dev/null 2>&1
+               if [ $? -ne 0 ]; then
+                    logit "ERROR:: Share ${_nfs_share_path_} associated with ${_nfs_mount_point_} is not available"
+                    return 1
+               fi
+
+         done < ${FILE_SYSTEMS_LIST}
+         
+         FILE_SYSTEMS_LIST_COUNT=`$CAT ${FILE_SYSTEMS_LIST}|$WC -l`
+         NAS_FS_LIST_COUNT=`$CAT ${NAS_TEMP}/nas_fs_list_file|$WC -l`
+         if [ ${FILE_SYSTEMS_LIST_COUNT} -eq ${NAS_FS_LIST_COUNT} ]; then
+              logit "All NAS file systems have been checked for file-system consumption, virtual IP accessibility and NAS share availability."
+              logit "WARNING:: Possible slowness being observed with NAS file systems"
+         fi
+    fi
+    
+    while read fs_config_LINE; do
+
+        NFS_MountPoint=`$ECHO ${fs_config_LINE} | $AWK -F"::" '{print $3}'`
+        
+        $TOUCH ${NFS_MountPoint}/${TAGFILE} >> /dev/null 2>&1 &
+        _ls_pid_num_=$!
+        LS_PID_LIST="${LS_PID_LIST} ${_ls_pid_num_}"  # Save pid to list
+
+        # Save the filesystem and PID in temp file
+        $ECHO "${_ls_pid_num_}::${NFS_MountPoint}" >> ${_temp_pid_list_file_}
+    done < ${FILE_SYSTEMS_LIST}
+
+    # Wait for "touch" to finish. Should be very quick, but in the event of a
+    # failover, it could take up to about 30 seconds
+
+    SLEEP_TIME=5
+    SLEEP_INTERVAL=5
+
+    # Time to check all the results of the background "touch" on the mount points in intervals of 5 seconds.
+    while [ ${SLEEP_TIME} -le ${WAIT_FOR_NAS_RESPONSE} ] ; do
+
+    if [ ! -z "${LS_PID_LIST}" ]; then
+        sleep_function ${SLEEP_INTERVAL}
+
+        for _ls_pid_ in ${LS_PID_LIST}; do
+            if [ -s ${_temp_pid_list_file_} ]; then
+                _nas_fs_=`$CAT ${_temp_pid_list_file_} | $EGREP ${_ls_pid_} | $AWK -F"::" '{print $2}'`
+            else
+                logit "WARNING:: File containing 'touch' information not found. Not possible to determine which filesystem is being operated on"
+            fi
+
+            # Check if the process has got completed.
+            # If completed then remove it from ${LS_PID_LIST} and check the exit status of touch process for that pid.
+            $KILL -0 ${_ls_pid_} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                LS_PID_LIST=`$ECHO ${LS_PID_LIST} | $SED "s/\<${_ls_pid_}\>//g"`
+                $WAIT ${_ls_pid_} >> /dev/null 2>&1
+                EXIT_CODE=$?
+                if [[ ${EXIT_CODE} -ne 0 ]]; then
+                     logit "ERROR:: Creating ${TAGFILE} on NAS filesystem ${_nas_fs_} is unsuccessful. Exit code from 'touch' PID ${_ls_pid_} is ${EXIT_CODE}"
+                    return_code=1
+                fi
+            fi
+        done
+    else
+        break
+    fi
+
+        SLEEP_TIME=`expr ${SLEEP_TIME} + ${SLEEP_INTERVAL}`
+    done
+
+    # TOUCH should have finished. If not kill it.
+    for _ls_pid_ in ${LS_PID_LIST}; do
+        if [ -s ${_temp_pid_list_file_} ]; then
+            _hanging_fs_=`$CAT ${_temp_pid_list_file_} | $EGREP ${_ls_pid_} | $AWK -F"::" '{print $2}'`
+        else
+            logit "WARNING:: File containing 'touch' information not found. Not possible to determine which filesystem is being operated on"
+        fi
+
+        $KILL -0 ${_ls_pid_} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            if [ -f $NAS_DEBUG_FILE ]; then
+                logit "Warning:: 'touch' on NAS filesystems hanging. Killing 'touch' process pid ${_ls_pid_} for ${_hanging_fs_} filesystem"
+            fi
+            _check_pname_=`$PS -p ${_ls_pid_} -o args=`
+            $ECHO ${_check_pname_} | $GREP ".*touch .*" >> /dev/null 2>&1
+            if [ $? -eq 0 ];then
+                _hung_touch_pid_elapsed_time_=`$PS -o etime= -p "${_ls_pid_}"`
+                logit "Elapsed time for 'touch' process pid ${_ls_pid_} for ${_hanging_fs_} filesystem is ${_hung_touch_pid_elapsed_time_}"
+                $KILL ${_ls_pid_} >> /dev/null 2>&1
+                $KILL -KILL ${_ls_pid_} >> /dev/null 2>&1
+                return_code=1
+            fi
+        else # Check exit status of finished 'touch' process
+            $WAIT ${_ls_pid_} >> /dev/null 2>&1
+            EXIT_CODE=$?
+            if [[ ${EXIT_CODE} -ne 0 ]]; then
+                logit "ERROR:: Creating ${TAGFILE} on NAS filesystem ${_hanging_fs_} is unsuccessful. Exit code from 'touch' PID ${_ls_pid_} is ${EXIT_CODE}"
+                return_code=1
+            fi
+        fi
+    done  # End of for loop checking results of background 'touch' processes
+    LS_PID_LIST=""
+
+    if [ ${return_code} -eq 0 ]; then
+        return 0
+    fi
+
+    # If NAS Failed to Respond. Then we should wait a reasonable amount of time to allow the NAS
+    # to failover before retrying. Failover could take about 20 seconds.
+    REPEATING_NAS_RESPONSE_ERROR_COUNT=`expr ${REPEATING_NAS_RESPONSE_ERROR_COUNT} + 1`
+    logit "Warning:: NAS filesystems failed to respond within ${WAIT_FOR_NAS_RESPONSE} seconds.
+           Waiting ${WAIT_FOR_FAILOVER} seconds before retry number ${REPEATING_NAS_RESPONSE_ERROR_COUNT}
+           This will allow the NAS to failover and recover before inactive services."
+    sleep_function ${WAIT_FOR_FAILOVER}
+done
+
+# Should not be any child processes running. Just make sure all are completed before continueing.
+# $WAIT
+return 1
+}
+
+### Function: disable_svc ###
+#
+# Stopping the NAS milestone Service to stop all dependent service
+#
+# Arguments: $svc_service
+#
+disable_svc()
+{
+local _svc_service_=$1
+local _service_state=`$SYSTEMCTL show ${_svc_service_} -p ActiveState | $AWK -F= '{print $2}'`
+
+
+if [ -n "${_service_state}" ]; then
+
+        if [ "${_service_state}" != "inactive" -a "${_service_state}" != "failed" ]; then # test if already inactive
+                logit "INFO:: inactive called for ${_svc_service_}"
+                 $SYSTEMCTL stop ${_svc_service_}
+                 _service_state=`$SYSTEMCTL show ${_svc_service_} -p ActiveState | $AWK -F= '{print $2}'`
+                 if [ "${_service_state}" == "inactive" ] ; then
+                     logit " ${_service_state} state set correctly for ${_svc_service_}"
+                     else
+                    logit " Failed to set inactive state for ${_svc_service_}"
+                     fi
+
+                $SYSTEMCTL disable ${_svc_service_}
+                if [ $? -eq 0 ]; then
+                    logit "INFO:: successfully disabled ${_svc_service_} service"
+                else
+                    logit "ERROR:: Unable to disabled ${_svc_service_} service"
+                fi
+                clear_eniq_svc
+        fi
+else
+    logit " ${_service_state} _service_state not set correctly"
+fi
+}
+
+### Function: enable_svc ###
+#
+# Checks that the service is active and if not it
+# start the service so that all services with a dependency
+# on having the NAS filesystems available can start.
+#
+# Arguments: $svc_service
+#
+enable_svc()
+{
+local _svc_service_=$1
+local _service_state=`$SYSTEMCTL show ${_svc_service_} -p ActiveState | $AWK -F= '{print $2}'`
+
+if [ -n "${_service_state}" ]; then
+        if [ "${_service_state}" != "active" ]; then
+            logit "INFO:: active called for ${_svc_service_}"
+            clear_eniq_svc
+            $SYSTEMCTL start ${_svc_service_}
+            _service_state=`$SYSTEMCTL show ${_svc_service_} -p ActiveState | $AWK -F= '{print $2}'`
+            if [ "${_service_state}" == "active" ] ; then
+                logit " ${_service_state} state set correctly for ${_svc_service_}"
+            else
+                logit " Failed to set active state for ${_svc_service_}"
+            fi
+            $SYSTEMCTL enable ${_svc_service_}
+            if [ $? -eq 0 ]; then
+                logit "INFO:: successfully enabled ${_svc_service_} service"
+            else
+                logit "ERROR:: Unable to enabled ${_svc_service_} service"
+            fi
+        fi
+
+else
+    logit " ${_service_state} _service_state not set correctly"
+fi
+}
+
+### Function: clear_eniq_svc ###
+#clear any eniq services in failed
+#
+clear_eniq_svc()
+{
+    $SYSTEMCTL list-units --type service --all | $GREP failed | $GREP 'eniq' | $AWK '{print $2}' | $XARGS $SYSTEMCTL reset-failed >> /dev/null 2>&1
+    $SYSTEMCTL list-units --type service --all | $GREP failed | $GREP 'ericsson' | $GREP 'ddc' | $AWK '{print $2}' | $XARGS $SYSTEMCTL reset-failed >> /dev/null 2>&1
+}
+
+### Function: get_configuration ###
+#
+# Sets / Updates all configuration data from NADd_config file.
+#
+# Uses Global Variable: NASd_FS_LIST_FILE, FILE_SYSTEMS_LIST
+# Arguments:        none
+# Return Values:    none
+#
+get_configuration()
+{
+local REPEATING_ERROR_COUNT=0
+while true; do
+    # ************* Gets list of filesystems to mount and mount points ***************
+    if [[ ! -s ${NASd_FS_LIST_FILE} ]]; then
+        # file containing filesystems to mount does not exist. Exit.
+        logit "WARNING:: File '${NASd_FS_LIST_FILE}' containing filesystems to mount could not be found. Sleeping..."
+    else
+
+        FILE_SYSTEMS_LIST=${NAS_TEMP}/NASd_FILE_SYSTEMS_LIST
+        $RM -f ${FILE_SYSTEMS_LIST} >> /dev/null 2>&1
+
+        $CAT ${NASd_FS_LIST_FILE} | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$' \
+             | $SED -e 's/^[ ]*//' -e 's/^[    ]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' \
+              > ${FILE_SYSTEMS_LIST}
+
+        if [[ ! -s ${FILE_SYSTEMS_LIST} ]]; then
+            logit "WARNING:: File '${FILE_SYSTEMS_LIST}' containing filesystems to mount was not created, or is empty."
+        else
+            logit "INFO:: File '${FILE_SYSTEMS_LIST}' containing filesystems to mount successfully created."
+            return 0
+        fi
+    fi
+
+    # If the config file is not found or is empty, then sleep and try later.
+    sleep 60
+    REPEATING_ERROR_COUNT=`expr ${REPEATING_ERROR_COUNT} + 1`
+    if [ "${REPEATING_ERROR_COUNT}" -ge "10" ]; then
+        sleep 600
+    fi
+    if [ "${REPEATING_ERROR_COUNT}" -ge "20" ]; then
+        sleep 60000
+    fi
+done
+}
+
+### Function: logit ###
+#
+#  Logs Messages to default logfile "LOGFILE"
+#
+# Uses Global Variables: "LOGFILE", "SERVER_HOSTNAME"
+# Arguments:  log_message
+# Return Values: 0 for success
+#                1 for error LOGFILE undefined
+logit()
+{
+local _log_msg
+
+if [ -n "${1}" ]; then
+    _log_msg="`$DATE '+%Y-%b-%d_%H.%M.%S'`:: ${1}"
+else
+    _log_msg="Error in Script $0 at `$DATE '+%Y-%b-%d_%H.%M.%S'`\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "${_log_msg}" >> ${LOGFILE}
+    return 0
+else
+    $ECHO -e "\n${_log_msg}"
+    return 1
+fi
+}
+
+### Function: mount_filesystems ###
+#
+#  Mount the filesystems listed in the file and
+#  create a hidden file on each f/s that we can test for later.
+#
+# Uses Global Variable: FILE_SYSTEMS_LIST, TAGFILE
+# Arguments: none
+# Return Values: 0 for success;
+#                !0 for errors;
+mount_filesystems()
+{
+# Save all background process pids
+MOUNT_PID_LIST=""
+local return_code=0
+local NFS_ServerIP=""
+local NFS_Share=""
+local NFS_MountPoint=""
+
+# Make a file to store the PID and the filesystem name
+_temp_mount_pid_list_file_=${NAS_TEMP}/temp_mount_pid_list_file
+$RM -f ${_temp_mount_pid_list_file_} >> /dev/null 2>&1
+
+# Loop through all filesystems listed in file.
+while read fs_config_LINE; do
+    NFS_ServerIP=`$ECHO ${fs_config_LINE} | $AWK -F"::" '{print $1}'`
+    NFS_Share=`$ECHO ${fs_config_LINE} | $AWK -F"::" '{print $2}'`
+    NFS_MountPoint=`$ECHO ${fs_config_LINE} | $AWK -F"::" '{print $3}'`
+
+    # Okay, an attempt to remove any processes that have a lock on the mountpoint.
+    # Mount command will fail if there is a lock on the mountpoint.
+    $KILL -9 `$LSOF ${NFS_MountPoint} | $AWK '{print $2}'| $SORT -un| $SED -n '2,$p'` >> /dev/null 2>&1
+
+    # If restore stage 5 in progress ,checking if parent directory is already mounted.
+    # If yes ,then creating child directory before mounting it
+    if [ -f "${RESTORE_STAGE_FILE}" ];then
+    _restore_stage_=`$CAT ${RESTORE_STAGE_FILE}  |$TAIL -1`
+        if [ "${_restore_stage_}" == "5" ];then
+                _parent_dir_=`$DIRNAME ${NFS_MountPoint}`
+                _mounted_dir_=`$DF -hk ${_parent_dir_} |$TAIL -1 |$AWK '{print $NF}'`
+                if [ "${_mounted_dir_}" != "/" ];then
+                        logit "INFO:: Creating directory structure ${NFS_MountPoint}"
+                        $MKDIR -p  ${NFS_MountPoint}
+                fi
+        fi
+    fi
+    $MOUNT -t nfs -o ${MOUNT_OPTIONS} ${NFS_ServerIP}:${NFS_Share} ${NFS_MountPoint}  >> /dev/null 2>&1 &
+    MOUNT_PID="$!"
+    MOUNT_PID_LIST="${MOUNT_PID_LIST} ${MOUNT_PID}"  # Save pid to list
+    # Build a file with the PIDs, and the mount information
+    $ECHO -e "${MOUNT_PID}::${NFS_ServerIP}::${NFS_Share}::${NFS_MountPoint}" >> ${_temp_mount_pid_list_file_}
+    logit "INFO:: Mounting filesystems. '$MOUNT -t nfs -o ${MOUNT_OPTIONS} ${NFS_ServerIP}:${NFS_Share} ${NFS_MountPoint}'. PID of command is ${MOUNT_PID}"
+done < ${FILE_SYSTEMS_LIST}
+
+# Wait for "mount" to finish about 5 seconds
+sleep_function ${MOUNT_TIME_OUT_TIME}
+
+# Time to check if all the mount commands finished successfully.
+for _mount_pid_ in ${MOUNT_PID_LIST}; do
+    if [ -s ${_temp_mount_pid_list_file_} ]; then
+        _hanging_mnt_fs_=`$CAT ${_temp_mount_pid_list_file_} | $EGREP ${_mount_pid_} | $AWK -F"::" '{print $3}'`
+        _mount_point_=`$CAT ${_temp_mount_pid_list_file_} | $EGREP ${_mount_pid_} | $AWK -F"::" '{print $4}'`
+    else
+        logit "WARNING:: File containing mount information not found. Not possible to determine which filesystem is being operated on"
+    fi
+
+    # MOUNT should have finished. If not kill it
+    $PS -eaf | $GREP -w ${_hanging_mnt_fs_} | $GREP -v $GREP >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        $KILL -0 ${_mount_pid_} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            return_code=5
+            logit "ERROR:: Mount hanging while trying to mount ${_hanging_mnt_fs_} filesystem. Killing mount PID ${_mount_pid_}"
+            $KILL ${_mount_pid_} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $SLEEP 1
+                $KILL -KILL ${_mount_pid_} >> /dev/null 2>&1
+            fi
+        else # Check exit status of finished "mount" process
+            $WAIT ${_mount_pid_} >> /dev/null 2>&1
+            EXIT_CODE=$?
+            if [[ ${EXIT_CODE} -ne 0 ]]; then
+                return_code=6
+                logit "ERROR:: Mounting filesystem ${_hanging_mnt_fs_} failed. Exit code from PID ${_mount_pid_} is ${EXIT_CODE}"
+            fi
+        fi
+    fi
+
+    #Checking the filesystem has been succesfully mounted or not
+    $DF -hk ${_mount_point_}  >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        logit "INFO:: Mounting filesystem ${_hanging_mnt_fs_} completed "
+    fi
+done  # End of for loop checking results of background "mount" processes
+
+MOUNT_PID_LIST=""
+
+if [ ${return_code} -eq 0 ]; then
+    # Loop through all filesystems and create a hidden file TAGFILE
+    # on each f/s that we can test for later.
+    while read fs_config_LINE; do
+        NFS_MountPoint=`echo ${fs_config_LINE} | $AWK -F"::" '{print $3}'`
+#        if [ ! -e ${NFS_MountPoint}/${TAGFILE} ]; then
+            $TOUCH ${NFS_MountPoint}/${TAGFILE}
+            if [ $? -eq 0 ]; then
+                logit "INFO:: Created tagfile ${TAGFILE} on ${NFS_MountPoint}"
+            else
+                logit "ERROR:: Unable to create tagfile ${TAGFILE} on ${NFS_MountPoint}"
+                return_code=7
+            fi
+#        fi
+    done < ${FILE_SYSTEMS_LIST}
+fi
+return ${return_code}
+}
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+setup_env()
+{
+
+# Source the common functions
+if [ -s ${ENIQ_LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_LIB_DIR}/common_functions.lib
+else
+   logit "File ${ENIQ_LIB_DIR}/common_functions.lib not found"
+   return 1
+fi
+
+# Getting list of NAS shares from the NAS server using storadm
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${ENIQ_CONF_DIR}/SunOS.ini -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    logit "Failed to get NAS API target dir information from ${ENIQ_CONF_DIR}/SunOS.ini"
+    return 1
+fi
+
+SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+if [ ! "${SAN_DEVICE}" ]; then
+    logit "Could not get the value of SAN_DEVICE"
+    return 1
+fi
+
+if  [ "${SAN_DEVICE}" != "local" ]; then
+    _spa_ip_=`$CAT ${ENIQ_CONF_DIR}/block_storage.ini | $GREP -w "BLK_STORAGE_IP_SPA" | $CUT -d "=" -f 2`
+    if [ ! "${_spa_ip_}" ]; then
+	logit "Could not get the value of san spa ip"
+	return 1
+    fi
+fi
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+     _nascli_=${_nas_sw_target_dir_}/bin/nascli
+     if [ ! -s ${_nascli_} ]; then
+          logit "${_nascli_} not found"
+          return 1
+     fi
+fi
+
+_nas_sysid_=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/storage.ini -v SYS_ID`
+if [ ! "${_nas_sysid_}" ]; then
+     logit "Could not get NAS sysid value from ${ENIQ_CONF_DIR}/storage.ini"
+     return 1
+fi
+}
+### Function: shutdown_and_exit ###
+#
+# Shutdown Shutdown the NASd cleanly.
+# First disable the NAS milestone to stop all dependencies.
+# Then unmount all filesystems.
+# Lastly ensure there are no hanging or unfinished subprocesses.
+#
+shutdown_and_exit()
+{
+local exit_status
+if [[ -n "${1}" ]]; then
+    exit_status=${1}
+else
+    exit_status=1
+fi
+
+disable_svc ${NAS_online_FMRI}
+terminate_any_child_processes
+unmount_filesystems
+logit "INFO:: EXITING NASd Monitor NOW"
+exit ${exit_status}
+}
+
+### Function: sleep_function ###
+#
+# Sleep; but checks for interrupt every second
+# Any Interupt functions should set WAKE=true to terminate sleep.
+#
+# Uses Global Variables: WAKE
+# Arguments: Number of seconds to sleep for.
+#
+sleep_function()
+{
+WAKE=false
+if [[ -n "${1}" ]]; then
+    for (( i=0; i < ${1}; i++ )); do
+        $SLEEP 1
+        if [[ "${WAKE}" = "true" ]]; then
+            return
+        fi
+    done
+else
+    logit "ERROR:: Error sleep_function called without parameter"
+    $SLEEP 1
+fi
+}
+
+### Function: terminate_any_child_processes ###
+#
+#  Cleanup any child proccesses that may be hung or left over,
+#  If script was interrupted before it cleaned up child processes
+#
+# Uses Global Variables: LS_PID_LIST, MOUNT_PID_LIST
+# Arguments:        none
+# Return Values:    none
+terminate_any_child_processes()
+{
+# If function check_mounted_filesystems was interrupted during a test of the mount points "touch" and the touch hangs
+# then there may be hung child processes that the function did not get to terminate.
+if [[ ! -z "${LS_PID_LIST}" ]]; then
+    $KILL -KILL ${LS_PID_LIST} >> /dev/null 2>&1
+    logit "INFO:: Terminating Child Processes; interrupted touch"
+    LS_PID_LIST=""
+fi
+
+# If the mount process is interrupted (trap a kill interrupt ) between attempting to mount fs
+# and checking the result, Then if these attempted mount processes hang;
+# We must make sure to terminate these processes.
+# The umount function will not kill them because the f/s are not mounted.
+# Otherwise these child process will remain after this script is treminated,
+# and SMF will terminate them and go into maintaince mode.
+if [[ ! -z "${MOUNT_PID_LIST}" ]]; then
+    $KILL -KILL ${MOUNT_PID_LIST} >> /dev/null 2>&1
+    logit "INFO:: Terminating Child Processes; interrupted mount"
+    MOUNT_PID_LIST=""
+fi
+}
+
+### Function: trap_restart_NASd ###
+#
+#  Restart NASd is called by trapping interrupt HUP USR1
+#  Disables NASd milestone and unmounts filesystems.
+#  Read config file, reset counters and wake from sleeps.
+#
+trap_restart_NASd()
+{
+logit "INFO:: Trapped a RESTART signal for NASd."
+
+disable_svc ${NAS_online_FMRI}
+terminate_any_child_processes
+unmount_filesystems
+
+# Should not be any child processed running. Better to ensure all above has
+# completed before restarting. i.e. NAS milestone disabled, and subshell returned.
+wait
+
+get_configuration
+if [ $? -ne 0 ]; then
+    shutdown_and_exit 1
+fi
+
+# Exits from sleep function immediately if interrupted during a sleep
+WAKE=true
+
+# reset backoff counter
+REPEATING_MOUNT_ERROR_COUNT=0
+return
+}
+
+### Function: trap_shutdown_and_exit ###
+#
+# Shutdown and Exit is called by trapping the USR2 or any of the Terminate interrupts
+#
+trap_shutdown_and_exit()
+{
+local exit_status
+if [[ -n "${1}" ]]; then
+    exit_status=${1}
+else
+    exit_status=1
+fi
+
+logit "INFO:: Trapped a TERMINATE signal for NASd."
+shutdown_and_exit ${exit_status}
+}
+
+### Function: unmount_filesystems ###
+#
+# Uses Global Variable: FILE_SYSTEMS_LIST
+# Arguments: none
+# Return Values: 0 for successful unmount of filesystems
+#                1 for errors unmounting filesystems
+#                120 could not find file containing filesystems to unmount
+unmount_filesystems()
+{
+local return_code=0
+local NFS_MountPoint=""
+
+# Loop through all filesystems listed in file. and umount asap.
+while read fs_config_LINE; do
+    NFS_MountPoint=`$ECHO ${fs_config_LINE} | ${AWK} -F"::" '{print $3}'`
+    ${UMOUNT} -l ${NFS_MountPoint} >> /dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        return_code=1
+    fi
+done < ${FILE_SYSTEMS_LIST}
+
+return ${return_code}
+}
+
+check_for_nfs_fs_threshold()
+{
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+    NAS_MOUNT_POINTS=`$CAT ${NASd_FS_LIST_FILE} | $AWK -F"::" '{print $2}'`
+    DF_FS_SIZE_OUTPUT=0
+    NAS_FS_SIZE_FLAG=0
+    #Loop for checking for the used % on each nas_name
+    for _nas_name in ${NAS_MOUNT_POINTS}; do
+        DF_FS_SIZE_OUTPUT=`$DF -hk | $GREP -w "${_nas_name}" | $AWK -F" " '{print $5}' | $CUT -d "%" -f 1`
+        if [[ "${DF_FS_SIZE_OUTPUT}" -ge 95 ]]; then
+            $ECHO -e "WARNING::NAS Filesystems have reached threshold size ${_nas_name}:${DF_FS_SIZE_OUTPUT}" >> ${LOGFILE}
+            NAS_FS_SIZE_FLAG=`$EXPR ${NAS_FS_SIZE_FLAG} + 1`
+        fi
+    done
+
+    if [ "${NAS_FS_SIZE_FLAG}" -ne 0 ]; then
+        disable_svc ${NAS_online_FMRI}
+        sleep_function 5
+        unmount_filesystems
+    fi  
+fi
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+logit "\n\nINFO:: ****** Starting NASd_Monitor_Script for ${SERVER_HOSTNAME} ******"
+# Check that the effective id of the user is root
+check_id root
+if [[ ${?} -ne 0 ]]; then
+    logit "ERROR:: You MUST be ROOT to execute Script $0, Exiting"
+    exit 1
+fi
+
+# Check if another Monitor script is running
+check_nas_process
+if [[ ${?} -ne 0 ]]; then
+    logit "ERROR:: Another instance of NAS monitor is running, Exiting"
+    exit 1
+fi
+
+# The milestone indicating the NAS filesystems are available and mounnted
+# should not be enabled at this point.
+disable_svc ${NAS_online_FMRI}
+
+# configuration data is set in this function
+get_configuration
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+trap "trap_restart_NASd" USR1      # Reset NAS Monitor ?
+trap "trap_restart_NASd" INT HUP   # Restart NAS Monitor ?   # Restart NAS milestone?
+trap "trap_shutdown_and_exit 0" USR2   # Stops NAS monitor script
+trap "trap_shutdown_and_exit 1" QUIT TERM ABRT TSTP # Stops NAS monitor script
+
+# Setup up path environment etc
+setup_env
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+# Track number of failed attempts to mount filesystems or contact mounted NFS.
+REPEATING_MOUNT_ERROR_COUNT=0
+
+# Call
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+# Continueous loop to monitor Filesystems and mount them if necessary
+# If Error, Loop repeats every ${LOOP_SLEEP_TIME} seconds, for the first ${LOOP_RETRYS_BEFORE_TIMEOUT} times
+# Then backs off and only tries every ${BACKOFF_SLEEP_TIME} seconds
+while true; do
+    # Check if the NFS filesystems are mounted. If not mounted then mount them.
+    check_for_NFS_mounts
+    if [ $? -ne 0 ]; then
+        let "REPEATING_MOUNT_ERROR_COUNT=${REPEATING_MOUNT_ERROR_COUNT}+1"
+
+        mount_filesystems
+        if [ $? -ne 0 ]; then
+            logit "ERROR:: NAS filesystems could not be mounted. "
+            # If NAS filesystems are not mounted, then NAS milestone should not be enabled.
+            disable_svc ${NAS_online_FMRI}
+            sleep_function 2
+            unmount_filesystems
+        else
+            logit "INFO:: NAS filesystems successfully mounted. "
+        fi
+    else
+        check_mounted_filesystems
+        if [ $? -eq 0 ]; then
+            # All mounts are ok, NAS milestone should be enabled.
+            REPEATING_MOUNT_ERROR_COUNT=0
+            enable_svc ${NAS_online_FMRI}
+            check_for_nfs_fs_threshold
+        else
+            let "REPEATING_MOUNT_ERROR_COUNT=${REPEATING_MOUNT_ERROR_COUNT}+1"
+
+            # Failover timout has been reached and NAS is still unavailable.
+            # Disable the NAS milestone and backoff from trying to mount filesystems every 2 seconds.
+            disable_svc ${NAS_online_FMRI}
+            sleep_function 5
+            logit "WARNING:: NAS filesystems unavailable; NAS milestone is in inactive stage. "
+            unmount_filesystems
+        fi
+    fi
+
+    sleep_function ${LOOP_SLEEP_TIME}  # Loop repeats every ${LOOP_SLEEP_TIME} seconds
+
+    # If attempting to mount or check the filesystems  continues to fail, then
+    # Backoff from trying to mount filesystems every 2 seconds.
+    if [ "${REPEATING_MOUNT_ERROR_COUNT}" -ge "${LOOP_RETRYS_BEFORE_TIMEOUT}" ]; then
+        sleep_function ${BACKOFF_SLEEP_TIME}
+    fi
+done     # End of while true loop. This monitor deamon should never end
+
+# Should never get here.
+logit "ERROR:: Exiting"
+
+exit 1
